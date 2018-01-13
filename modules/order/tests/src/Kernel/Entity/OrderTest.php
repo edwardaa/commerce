@@ -8,6 +8,8 @@ use Drupal\commerce_order\Entity\OrderItem;
 use Drupal\commerce_order\Entity\OrderItemType;
 use Drupal\commerce_price\Exception\CurrencyMismatchException;
 use Drupal\commerce_price\Price;
+use Drupal\commerce_payment\Entity\Payment;
+use Drupal\commerce_payment\Entity\PaymentGateway;
 use Drupal\profile\Entity\Profile;
 use Drupal\Tests\commerce\Kernel\CommerceKernelTestBase;
 
@@ -36,6 +38,8 @@ class OrderTest extends CommerceKernelTestBase {
     'entity_reference_revisions',
     'profile',
     'state_machine',
+    'commerce_payment',
+    'commerce_payment_example',
     'commerce_product',
     'commerce_order',
   ];
@@ -49,6 +53,7 @@ class OrderTest extends CommerceKernelTestBase {
     $this->installEntitySchema('profile');
     $this->installEntitySchema('commerce_order');
     $this->installEntitySchema('commerce_order_item');
+    $this->installEntitySchema('commerce_payment');
     $this->installConfig('commerce_order');
 
     // An order item type that doesn't need a purchasable entity, for simplicity.
@@ -57,6 +62,13 @@ class OrderTest extends CommerceKernelTestBase {
       'label' => 'Test',
       'orderType' => 'default',
     ])->save();
+
+    $payment_gateway = PaymentGateway::create([
+      'id' => 'example',
+      'label' => 'Example',
+      'plugin' => 'example_onsite',
+    ]);
+    $payment_gateway->save();
 
     $user = $this->createUser();
     $this->user = $this->reloadEntity($user);
@@ -96,6 +108,11 @@ class OrderTest extends CommerceKernelTestBase {
    * @covers ::getSubtotalPrice
    * @covers ::recalculateTotalPrice
    * @covers ::getTotalPrice
+   * @covers ::getBalance
+   * @covers ::addPayment
+   * @covers ::subtractPayment
+   * @covers ::setTotalPaid
+   * @covers ::getTotalPaid
    * @covers ::getState
    * @covers ::getRefreshState
    * @covers ::setRefreshState
@@ -138,6 +155,7 @@ class OrderTest extends CommerceKernelTestBase {
     $order = Order::create([
       'type' => 'default',
       'state' => 'completed',
+      'store_id' => $this->store->id(),
     ]);
     $order->save();
 
@@ -183,6 +201,7 @@ class OrderTest extends CommerceKernelTestBase {
     $this->assertNotEmpty($order->hasItem($another_order_item));
 
     $this->assertEquals(new Price('8.00', 'USD'), $order->getTotalPrice());
+    $this->assertEquals(new Price('8.00', 'USD'), $order->getBalance());
     $adjustments = [];
     $adjustments[] = new Adjustment([
       'type' => 'custom',
@@ -213,6 +232,7 @@ class OrderTest extends CommerceKernelTestBase {
     $order->removeAdjustment($adjustments[0]);
     $this->assertEquals(new Price('8.00', 'USD'), $order->getSubtotalPrice());
     $this->assertEquals(new Price('18.00', 'USD'), $order->getTotalPrice());
+    $this->assertEquals(new Price('18.00', 'USD'), $order->getBalance());
     $this->assertEquals([$adjustments[1], $adjustments[2]], $order->getAdjustments());
     $order->setAdjustments($adjustments);
     $this->assertEquals($adjustments, $order->getAdjustments());
@@ -250,6 +270,70 @@ class OrderTest extends CommerceKernelTestBase {
     $collected_adjustments = $order->collectAdjustments();
     $this->assertEquals($multiplied_order_item_adjustments[0], $collected_adjustments[0]);
     $this->assertEquals($multiplied_order_item_adjustments[1], $collected_adjustments[1]);
+    $order->addPayment(new Price('20.00', 'USD'));
+    $this->assertEquals(new Price('20.00', 'USD'), $order->getTotalPaid());
+    $this->assertEquals(new Price('21.00', 'USD'), $order->getBalance());
+    $order->subtractPayment(new Price('5.00', 'USD'));
+    $this->assertEquals(new Price('15.00', 'USD'), $order->getTotalPaid());
+    $this->assertEquals(new Price('26.00', 'USD'), $order->getBalance());
+    $order->setTotalPaid(new Price('41.00', 'USD'));
+    $this->assertEquals(new Price('0.00', 'USD'), $order->getBalance());
+    $order->setTotalPaid(new Price('0.00', 'USD'));
+    $this->assertEquals(new Price('41.00', 'USD'), $order->getBalance());
+
+    // Test that payments update the order total paid and balance.
+    $order->save();
+    $payment = Payment::create([
+      'order_id' => $order->id(),
+      'amount' => new Price('25.00', 'USD'),
+      'payment_gateway' => 'example',
+      'state' => 'completed',
+    ]);
+    $payment->save();
+    $order = Order::load($order->id());
+    $this->assertEquals(new Price('25.00', 'USD'), $order->getTotalPaid());
+    $this->assertEquals(new Price('16.00', 'USD'), $order->getBalance());
+    $payment->setState('partially_refunded')->save();
+    $payment->setRefundedAmount(new Price('5.00', 'USD'))->save();
+    $order = Order::load($order->id());
+    $this->assertEquals(new Price('20.00', 'USD'), $order->getTotalPaid());
+    $this->assertEquals(new Price('21.00', 'USD'), $order->getBalance());
+    $payment->delete();
+    $order = Order::load($order->id());
+    $this->assertEquals(new Price('0.00', 'USD'), $order->getTotalPaid());
+    $this->assertEquals(new Price('41.00', 'USD'), $order->getBalance());
+    $payment2 = Payment::create([
+      'order_id' => $order->id(),
+      'amount' => new Price('41.00', 'USD'),
+      'payment_gateway' => 'example',
+      'state' => 'completed',
+    ]);
+    $payment2->save();
+    $order = Order::load($order->id());
+    $this->assertEquals(new Price('41.00', 'USD'), $order->getTotalPaid());
+    $this->assertEquals(new Price('0.00', 'USD'), $order->getBalance());
+
+    // Test that payments not in completed or partially_refunded state do not affect order balance.
+    $payment3 = Payment::create([
+      'order_id' => $order->id(),
+      'amount' => new Price('25.00', 'USD'),
+      'payment_gateway' => 'example',
+      'state' => 'new',
+    ]);
+    $payment3->save();
+    $order = Order::load($order->id());
+    $this->assertEquals(new Price('41.00', 'USD'), $order->getTotalPaid());
+    $this->assertEquals(new Price('0.00', 'USD'), $order->getBalance());
+    $payment3->delete();
+    $order = Order::load($order->id());
+    $this->assertEquals(new Price('41.00', 'USD'), $order->getTotalPaid());
+    $this->assertEquals(new Price('0.00', 'USD'), $order->getBalance());
+
+    // Test that the total paid amount can be set explicitly on the order.
+    $order->setTotalPaid(new Price('0.00', 'USD'));
+    $order->save();
+    $this->assertEquals(new Price('41.00', 'USD'), $order->getBalance());
+
     // Confirm that locked adjustments persist after clear.
     // Custom adjustments are locked by default.
     $order->setAdjustments($adjustments);
